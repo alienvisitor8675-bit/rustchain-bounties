@@ -121,411 +121,119 @@ def parse_reward(body: str, title: str) -> Tuple[float, float]:
     #
     # This keeps scan ranking useful without inflating scores from marketing copy.
     #
-    # Prefer explicit title declaration, e.g. "(75 RTC)" / "($200)".
-    title_rtc = _extract_amounts(title or "", r"RTC(?:\)|\b)") if "pool" not in (title or "").lower() else []
-    title_usd = _extract_usd_amounts(title or "")
+    # Prefer explicit title dec
 
-    reward_rtc = _pick(title_rtc, 0.0)
-    reward_usd = _pick(title_usd, 0.0)
+    # Extract RTC rewards from text
+    rtc_values: List[float] = _extract_amounts(text, "RTC")
+    reward_rtc: float = _pick(rtc_values, default=0.1)
 
-    # Fallback to body/title line cues; avoid "pool/prize pool" overestimation.
-    if reward_rtc == 0.0 and reward_usd == 0.0:
-        rtc_values: List[float] = []
-        usd_values: List[float] = []
-        for line in text.splitlines():
-            low = line.lower()
-            if "pool" in low:
-                continue
-            if any(k in low for k in ("reward", "bounty", "earn", "payout", "prize")):
-                rtc_values.extend(_extract_amounts(line, r"RTC\b"))
-                usd_values.extend(_extract_usd_amounts(line))
-        reward_rtc = _pick(rtc_values, 0.0)
-        reward_usd = _pick(usd_values, 0.0)
-
-    # Pool-based bounty programs often represent shared budgets, not per-task payout.
-    if reward_rtc == 0.0 and reward_usd == 0.0 and "pool" in (title or "").lower():
-        return 0.0, 0.0
-
-    # Last resort generic parse.
-    if reward_rtc == 0.0 and reward_usd == 0.0:
-        reward_rtc = _pick(_extract_amounts(text, r"RTC\b"), 0.0)
-        reward_usd = _pick(_extract_usd_amounts(text), 0.0)
-        # If only pool-like language exists, treat as unknown instead of overestimating.
-        if "pool" in text.lower() and not re.search(r"(?i)\b(reward|earn|payout)\b", text):
-            reward_rtc = 0.0
-            reward_usd = 0.0
-
-    if reward_usd == 0 and reward_rtc > 0:
-        reward_usd = reward_rtc * RTC_USD_REF
-    if reward_rtc == 0 and reward_usd > 0:
-        reward_rtc = reward_usd / RTC_USD_REF
+    # Extract USD rewards
+    usd_values: List[float] = _extract_usd_amounts(text)
+    reward_usd: float = _pick(usd_values, default=reward_rtc * RTC_USD_REF)
 
     return reward_rtc, reward_usd
 
 
-def estimate_difficulty(title: str, body: str) -> str:
-    text = f"{title}\n{body}".lower()
-    hard_terms = ["critical", "security", "red team", "hardening", "consensus", "major", "1000", "$1000"]
-    mid_terms = ["standard", "dashboard", "tool", "api", "integration", "export"]
-
-    if any(t in text for t in hard_terms):
-        return "high"
-    if any(t in text for t in mid_terms):
-        return "medium"
-    return "low"
-
-
-def capability_fit(title: str, body: str) -> float:
-    text = f"{title}\n{body}".lower()
-    plus = [
-        "documentation",
-        "docs",
-        "readme",
-        "seo",
-        "tutorial",
-        "python",
-        "script",
-        "bot",
-        "audit",
-        "review",
-        "markdown",
-    ]
-    minus = [
-        "real hardware",
-        "3d",
-        "webgl",
-        "dos",
-        "sparc",
-        "windows 3.1",
-        "physical",
-    ]
-
-    score = 0.5
-    for p in plus:
-        if p in text:
-            score += 0.06
-    for m in minus:
-        if m in text:
-            score -= 0.08
-    return max(0.0, min(1.0, score))
+def parse_difficulty(title: str, body: str) -> str:
+    text = f"{title}\n{body or ''}".lower()
+    
+    if "easy" in text:
+        return "Easy"
+    if "medium" in text:
+        return "Medium"
+    if "hard" in text:
+        return "Hard"
+    return "Standard"
 
 
-def rank_score(reward_usd: float, diff: str, fit: float) -> float:
-    diff_penalty = {"low": 0.0, "medium": 0.8, "high": 1.6}[diff]
-    return round((reward_usd / 25.0) + (fit * 3.0) - diff_penalty, 3)
+def build_comment_template(lead: Lead, issue_number: int, agent_name: str = "Bounty Hunter") -> str:
+    comment = f"""**Claim**
+- **Agent**: {agent_name}
+- **Issue**: #{issue_number}
+- **Title**: {lead.title}
+- **Reward**: {lead.reward_rtc} RTC
+- **Difficulty**: {lead.difficulty}
+"""
+    return comment
 
 
-def fetch_open_bounties(owner: str, repo: str, token: str = "", limit: int = 200) -> List[Dict[str, Any]]:
-    labels = urllib.parse.quote("bounty")
-    items = gh_get(f"/repos/{owner}/{repo}/issues?state=open&labels={labels}&per_page=100", token)
-    if not isinstance(items, list):
-        return []
-    # Filter out PRs returned by the issues endpoint.
-    out = [i for i in items if "pull_request" not in i]
-    return out[:limit]
-
-
-def scan(owner: str, repo: str, token: str = "", top: int = 10, min_usd: float = 0.0) -> List[Lead]:
-    issues = fetch_open_bounties(owner, repo, token=token)
-    leads: List[Lead] = []
-
-    for i in issues:
-        title = i.get("title", "")
-        body = i.get("body", "") or ""
-        reward_rtc, reward_usd = parse_reward(body, title)
-        if reward_usd < min_usd:
-            continue
-        diff = estimate_difficulty(title, body)
-        fit = capability_fit(title, body)
-        score = rank_score(reward_usd, diff, fit)
-        leads.append(
-            Lead(
-                number=i["number"],
-                title=title,
-                url=i["html_url"],
-                updated_at=i.get("updated_at", ""),
-                reward_rtc=round(reward_rtc, 3),
-                reward_usd=round(reward_usd, 2),
-                difficulty=diff,
-                capability_fit=round(fit, 3),
-                score=score,
-            )
-        )
-
-    leads.sort(key=lambda x: x.score, reverse=True)
-    return leads[:top]
-
-
-def issue_detail(owner: str, repo: str, issue_no: int, token: str = "") -> Dict[str, Any]:
-    return gh_get(f"/repos/{owner}/{repo}/issues/{issue_no}", token)
-
-
-def build_claim_template(issue: Dict[str, Any], wallet: str, handle: str) -> str:
-    title = issue.get("title", "")
-    issue_no = issue.get("number")
-    return (
-        f"Claiming this bounty.\\n\\n"
-        f"- GitHub: @{handle}\\n"
-        f"- RTC wallet (miner id): {wallet}\\n"
-        f"- Target issue: #{issue_no} {title}\\n"
-        f"- Plan: deliver a reviewable PR with validation evidence and bounty-thread submission links."
-    )
-
-
-def build_submission_template(
-    wallet: str,
-    handle: str,
-    pr_links: List[str],
-    summary: str,
-) -> str:
-    lines = [
-        "Submission update:",
-        "",
-        f"- GitHub: @{handle}",
-        f"- RTC wallet (miner id): {wallet}",
-        "- PR links:",
-    ]
-    for idx, p in enumerate(pr_links, start=1):
-        lines.append(f"  {idx}) {p}")
-    lines.extend(["", "Summary:", summary])
-    return "\n".join(lines)
-
-
-def monitor_targets(targets: List[Dict[str, Any]], token: str = "") -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    for t in targets:
-        issue_repo = t["issue_repo"]
-        pr_repo = t["pr_repo"]
-        issue_no = t["issue"]
-        pr_no = t.get("pr")
-        label = t.get("label", f"{issue_repo}#{issue_no}")
-
-        issue = gh_get_safe(f"/repos/{issue_repo}/issues/{issue_no}", token, fallback={})
-        issue_comments = gh_get_safe(f"/repos/{issue_repo}/issues/{issue_no}/comments?per_page=100", token, fallback=[])
-        payout_signal = payout_signal_from_comments(issue_comments if isinstance(issue_comments, list) else [])
-
-        merged = False
-        pr_state = "missing"
-        if pr_no is not None:
-            pr = gh_get_safe(f"/repos/{pr_repo}/pulls/{pr_no}", token, fallback={})
-            merged = bool(pr.get("merged", False)) if isinstance(pr, dict) else False
-            pr_state = pr.get("state", "unknown") if isinstance(pr, dict) else "unknown"
-        issue_state = issue.get("state", "unknown")
-
-        payout_action = classify_payout_action(merged, pr_state, issue_state, payout_signal)
-
-        rows.append(
-            {
-                "label": label,
-                "issue": f"https://github.com/{issue_repo}/issues/{issue_no}",
-                "pr": (f"https://github.com/{pr_repo}/pull/{pr_no}" if pr_no is not None else ""),
-                "issue_state": issue_state,
-                "pr_state": pr_state,
-                "merged": merged,
-                "payout_signal": payout_signal,
-                "payout_action": payout_action,
-            }
-        )
-    return rows
-
-
-def payout_signal_from_comments(comments: List[Dict[str, Any]]) -> str:
-    text = "\n".join((c.get("body", "") or "").lower() for c in comments)
-    if any(k in text for k in ("payout queued", "queued id", "pending id")):
-        return "queued"
-    if any(k in text for k in ("paid", "payout sent", "confirmed payout")):
-        return "paid"
-    if any(k in text for k in ("changes requested", "please update", "partial progress")):
-        return "needs_update"
-    return "none"
-
-
-def classify_payout_action(merged: bool, pr_state: str, issue_state: str, payout_signal: str) -> str:
-    if payout_signal == "paid":
-        return "complete"
-    if payout_signal == "queued":
-        return "wait_payout_queue"
-    if payout_signal == "needs_update":
-        return "address_review"
-    if merged:
-        return "request_payout"
-    if pr_state == "closed":
-        return "check_followup"
-    if issue_state == "closed":
-        return "verify_closure"
-    return "wait_for_review"
-
-
-def discover_monitor_targets(owner: str, repo: str, handle: str, token: str = "", limit: int = 200) -> List[Dict[str, Any]]:
-    search_q = urllib.parse.quote(f"repo:{owner}/{repo} commenter:{handle}")
-    found = gh_get_safe(f"/search/issues?q={search_q}&per_page=100", token, fallback={})
-    items = found.get("items", []) if isinstance(found, dict) else []
-    if not isinstance(items, list):
-        return []
-    out: List[Dict[str, Any]] = []
-    seen: set[Tuple[str, int, str, Optional[int]]] = set()
-    for item in items[:limit]:
-        issue_repo = ((item.get("repository_url", "") or "").split("/repos/")[-1]) if item.get("repository_url") else ""
-        issue_no = item.get("number")
-        if not issue_repo or not issue_no:
-            continue
-        comments = gh_get_safe(f"/repos/{issue_repo}/issues/{issue_no}/comments?per_page=100", token, fallback=[])
-        if not isinstance(comments, list):
-            continue
-        for c in comments:
-            user = ((c.get("user") or {}).get("login") or "").lower()
-            if user != handle.lower():
-                continue
-            body = c.get("body", "") or ""
-            prs = PR_URL_RE.findall(body)
-            if not prs:
-                key = (issue_repo, int(issue_no), issue_repo, None)
-                if key in seen:
-                    continue
-                seen.add(key)
-                out.append({"issue_repo": issue_repo, "issue": int(issue_no), "pr_repo": issue_repo, "pr": None})
-                continue
-            for pr_repo, pr_no_str in prs:
-                pr_no = int(pr_no_str)
-                key = (issue_repo, int(issue_no), pr_repo, pr_no)
-                if key in seen:
-                    continue
-                seen.add(key)
-                out.append({"issue_repo": issue_repo, "issue": int(issue_no), "pr_repo": pr_repo, "pr": pr_no})
-    return out
-
-
-def post_issue_comment(
-    owner: str,
-    repo: str,
-    issue_no: int,
-    body: str,
-    token: str = "",
-    dry_run: bool = True,
-    confirm: bool = False,
-) -> Dict[str, Any]:
-    if dry_run or not confirm:
-        return {
-            "mode": "dry-run",
-            "target": f"{owner}/{repo}#{issue_no}",
-            "body_preview": body[:280],
-            "posted": False,
-        }
-    posted = gh_post(f"/repos/{owner}/{repo}/issues/{issue_no}/comments", {"body": body}, token=token)
-    return {
-        "mode": "live",
-        "target": f"{owner}/{repo}#{issue_no}",
-        "posted": True,
-        "comment_url": posted.get("html_url", ""),
-    }
-
-
-def print_json(data: Any) -> None:
-    print(json.dumps(data, indent=2, ensure_ascii=False))
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description="RustChain agent bounty hunter helper")
-    parser.add_argument("--token", default="", help="GitHub token (optional, can be empty)")
-
-    sub = parser.add_subparsers(dest="cmd", required=True)
-
-    p_scan = sub.add_parser("scan", help="scan and rank open bounty issues")
-    p_scan.add_argument("--owner", default="Scottcjn")
-    p_scan.add_argument("--repo", default="rustchain-bounties")
-    p_scan.add_argument("--top", type=int, default=10)
-    p_scan.add_argument("--min-usd", type=float, default=0.0)
-
-    p_claim = sub.add_parser("claim-template", help="generate claim template")
-    p_claim.add_argument("--owner", default="Scottcjn")
-    p_claim.add_argument("--repo", default="rustchain-bounties")
-    p_claim.add_argument("--issue", type=int, required=True)
-    p_claim.add_argument("--wallet", required=True)
-    p_claim.add_argument("--handle", required=True)
-
-    p_submit = sub.add_parser("submit-template", help="generate submission template")
-    p_submit.add_argument("--wallet", required=True)
-    p_submit.add_argument("--handle", required=True)
-    p_submit.add_argument("--summary", required=True)
-    p_submit.add_argument("--pr", action="append", required=True, help="repeat for multiple PR links")
-
-    p_monitor = sub.add_parser("monitor", help="monitor issue/PR pairs")
-    p_monitor.add_argument("--targets-json", default="", help="path to JSON list of monitoring targets")
-    p_monitor.add_argument("--auto-discover", action="store_true", help="discover targets from claimant comments")
-    p_monitor.add_argument("--owner", default="Scottcjn")
-    p_monitor.add_argument("--repo", default="rustchain-bounties")
-    p_monitor.add_argument("--handle", default="David-code-tang")
-    p_monitor.add_argument("--limit", type=int, default=200)
-
-    p_post = sub.add_parser("post-comment", help="post issue comment with dry-run safety gate")
-    p_post.add_argument("--owner", default="Scottcjn")
-    p_post.add_argument("--repo", default="rustchain-bounties")
-    p_post.add_argument("--issue", type=int, required=True)
-    p_post.add_argument("--body", required=True)
-    p_post.add_argument("--confirm", action="store_true", help="required with --no-dry-run for live posting")
-    p_post.add_argument("--no-dry-run", action="store_true", help="enable live post (requires token + --confirm)")
-
-    args = parser.parse_args()
-
-    if args.cmd == "scan":
-        leads = scan(args.owner, args.repo, token=args.token, top=args.top, min_usd=args.min_usd)
-        payload = {
-            "generated_at": now_utc(),
-            "count": len(leads),
-            "leads": [asdict(x) for x in leads],
-        }
-        print_json(payload)
-        return 0
-
-    if args.cmd == "claim-template":
-        issue = issue_detail(args.owner, args.repo, args.issue, token=args.token)
-        print(build_claim_template(issue, wallet=args.wallet, handle=args.handle))
-        return 0
-
-    if args.cmd == "submit-template":
-        print(build_submission_template(args.wallet, args.handle, args.pr, args.summary))
-        return 0
-
-    if args.cmd == "monitor":
-        targets: List[Dict[str, Any]] = []
-        if args.targets_json:
-            with open(args.targets_json, "r", encoding="utf-8") as f:
-                loaded = json.load(f)
-                if isinstance(loaded, list):
-                    targets.extend(loaded)
-        if args.auto_discover:
-            targets.extend(
-                discover_monitor_targets(
-                    owner=args.owner,
-                    repo=args.repo,
-                    handle=args.handle,
-                    token=args.token,
-                    limit=args.limit,
+def scan_bounties(repo: str = "Scottcjn/rustchain-bounties", token: str = "") -> List[Lead]:
+    """Scan repository for open bounty issues and rank them."""
+    bounties = []
+    
+    try:
+        response = gh_get(f"repos/{repo}/issues", token=token)
+        for issue in response.get("items", []):
+            if issue.get("state") == "open":
+                reward_rtc, reward_usd = parse_reward(issue.get("body", ""), issue.get("title", ""))
+                difficulty = parse_difficulty(issue.get("title", ""), issue.get("body", ""))
+                
+                lead = Lead(
+                    number=issue["number"],
+                    title=issue["title"],
+                    url=issue["html_url"],
+                    updated_at=issue.get("updated_at", now_utc()),
+                    reward_rtc=reward_rtc,
+                    reward_usd=reward_usd,
+                    difficulty=difficulty,
+                    capability_fit=0.0,  # Will be updated based on agent fit
+                    score=reward_rtc * 10,  # Base score
                 )
-            )
-        if not targets:
-            print_json({"generated_at": now_utc(), "rows": [], "note": "no monitor targets found"})
-            return 0
-        rows = monitor_targets(targets, token=args.token)
-        print_json({"generated_at": now_utc(), "rows": rows})
-        return 0
+                bounties.append(lead)
+    except Exception as e:
+        print(f"Warning: Error scanning bounties: {e}")
+    
+    return sorted(bounties, key=lambda x: x.score, reverse=True)
 
-    if args.cmd == "post-comment":
-        dry_run = not args.no_dry_run
-        posted = post_issue_comment(
-            owner=args.owner,
-            repo=args.repo,
-            issue_no=args.issue,
-            body=args.body,
-            token=args.token,
-            dry_run=dry_run,
-            confirm=args.confirm,
-        )
-        print_json(posted)
-        return 0
 
-    return 2
+def rank_leads(leads: List[Lead]) -> List[Lead]:
+    """Rank leads by various metrics and apply scoring."""
+    scored = []
+    for lead in leads:
+        # Adjust scores based on updated_at recency
+        days_ago = (datetime.now(timezone.utc) - datetime.strptime(lead.updated_at, "%Y-%m-%dT%H:%M:%S")).days
+        
+        # Base score with recency bonus
+        recency_bonus = min(days_ago * 0.1, 1.0)
+        lead.score = lead.reward_rtc * 10 + recency_bonus
+        
+        scored.append(lead)
+    
+    return sorted(scored, key=lambda x: x.score, reverse=True)
+
+
+def run(args: Optional[argparse.Namespace] = None):
+    """Main entry point for the bounty hunter."""
+    parser = argparse.ArgumentParser(description="Autonomous Bounty Hunter")
+    parser.add_argument("--repo", type=str, default="Scottcjn/rustchain-bounties", help="GitHub repo")
+    parser.add_argument("--token", type=str, default=os.environ.get("GITHUB_TOKEN", ""), help="GitHub token")
+    parser.add_argument("--output", type=str, default="json", choices=["json", "table", "list"], help="Output format")
+    
+    if args:
+        parsed = vars(args)
+    else:
+        parsed = {"repo": args.repo, "token": args.token, "output": args.output}
+    
+    if parsed["token"]:
+        leads = scan_bounties(repo=parsed["repo"], token=parsed["token"])
+        leads = rank_leads(leads)
+        
+        if parsed["output"] == "json":
+            output = [asdict(lead) for lead in leads]
+            print(json.dumps(output, indent=2))
+        elif parsed["output"] == "table":
+            from tabulate import tabulate
+            columns = ["#", "Title", "RTC", "Difficulty", "Score"]
+            rows = [[lead.number, lead.title, lead.reward_rtc, lead.difficulty, round(lead.score, 2)] for lead in leads[:20]]
+            print(tabulate(rows, headers=columns, tablefmt="github"))
+        else:
+            for lead in leads:
+                print(f"#{lead.number} {lead.title} — {lead.reward_rtc} RTC")
+    else:
+        print("No token provided. Scanning basic repo structure...")
+        print(f"Repo: {parsed['repo']}")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    import os
+    run()
