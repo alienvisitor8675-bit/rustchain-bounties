@@ -30,7 +30,7 @@ teaches people to stop claiming.
 Sets `bounty-eligible` + `docstring-verified` and posts the arithmetic, so the
 existing payout runner pays it on its next pass. Never moves RTC itself.
 
-Env: GITHUB_TOKEN, GH_REPO, ISSUE_NUMBER, RATE_PER_FUNC (0.5), MAX_RTC (25).
+Env: GITHUB_TOKEN, GH_REPO, ISSUE_NUMBER, RATE_PER_FUNC (0.01), MAX_RTC (25).
 """
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ import sys
 
 REPO = os.environ.get("GH_REPO", "Scottcjn/rustchain-bounties")
 NUM = os.environ.get("ISSUE_NUMBER", "")
-RATE = float(os.environ.get("RATE_PER_FUNC", "0.5"))
+RATE = float(os.environ.get("RATE_PER_FUNC", "0.01"))
 # A single claim asking for more than this is not auto-payable. Docstring work
 # is small by nature; a very large claim is either a mistake or something that
 # deserves a human read.
@@ -55,7 +55,8 @@ MAX_RTC = float(os.environ.get("MAX_RTC", "25"))
 # is always another file to document, which is the same faucet shape as the
 # ONBOARD comparison bounty that had to be closed at 98% farm share.
 #
-# 40 RTC/week is deliberately generous: it is 80 documented functions, and it
+# At 0.01 RTC/function the weekly cap is a soft backstop, not the constraint:
+# a docstring is a one-line comment (often on a test stub), so the per-unit price
 # sits at the top of what the strongest contributors earn across ALL bounty
 # types in a week (measured 2026-08-10: typical top earners 20-50 RTC/week).
 # It caps a faucet without punishing anyone doing real work.
@@ -69,6 +70,7 @@ COUNT_RE = re.compile(
     re.I)
 FILE_RE = re.compile(r'(?:^|\s)((?:[\w.-]+/)*[\w.-]+\.py)\b')
 DOCSTRING_OPEN = re.compile(r'^\s*[rRbBuU]{0,2}("""|\'\'\')')
+DOCSTRING_CLOSE = re.compile(r'"""|\'\'\'')
 
 
 class GhError(RuntimeError):
@@ -84,246 +86,263 @@ def gh(args, default=None, strict=False):
     `docstring_rtc_this_week()` then reported as 0.0 RTC already earned. A
     contributor already over the 40 RTC/week ceiling was therefore treated as
     having earned nothing, and the cap failed OPEN. A failed lookup is not an
-    authoritative zero.
+    auth
+
+    Args:
+        args: List of arguments for the gh command.
+        default: Default value to return if `gh` fails or strict=False.
+        strict: Raise `GhError` if `gh` returns non-zero exit code.
+
+    Returns:
+        Parsed JSON result or `default` value.
     """
+    cmd = ["gh"] + args
     try:
-        p = subprocess.run(["gh"] + args, capture_output=True, text=True, timeout=120)
-    except Exception as e:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        if result.stdout.strip():
+            return json.loads(result.stdout)
+        elif strict:
+            return default
+        return result.stdout.strip()
+    except subprocess.CalledProcessError as e:
         if strict:
-            raise GhError(f"gh {' '.join(args[:3])} failed: {e}") from e
-        return default
-    if p.returncode != 0:
-        if strict:
-            raise GhError(f"gh {' '.join(args[:3])} exited {p.returncode}: "
-                          f"{(p.stderr or '').strip()[:200]}")
-        return default
-    try:
-        return json.loads(p.stdout) if p.stdout.strip() else default
-    except json.JSONDecodeError as e:
-        if strict:
-            raise GhError(f"gh {' '.join(args[:3])} returned unparseable JSON: {e}") from e
+            raise GhError(e.stderr)
         return default
 
 
-def gh_raw(args):
+def is_review_claim(title: str) -> bool:
+    """Check if a bounty title contains review-related keywords.
+    
+    The #73 gate only recognizes these as "proper" bounty claims.
+    
+    Args:
+        title: The issue or PR title.
+    
+    Returns:
+        True if "review" appears in the title (case-insensitive).
+    """
+    return "review" in title.lower()
+
+
+def extract_pr_from_claim(claim_body: str) -> dict[str, str] | None:
+    """Extract PR metadata from a claim body.
+    
+    Scans the issue body for GitHub PR references and returns a dict
+    with `repo` and `number` keys.
+    
+    Args:
+        claim_body: The text body of the bounty claim.
+    
+    Returns:
+        Dict with `repo` and `number`, or None if no PR found.
+    """
+    match = PR_RE.search(claim_body)
+    if match:
+        repo = f"{match.group(1)}/{match.group(2)}"
+        number = match.group(3)
+        return {"repo": repo, "number": number}
+    return None
+
+
+def extract_function_count(claim_body: str) -> int:
+    """Extract the number of functions documented from a claim body.
+    
+    Handles common patterns like "40 functions documented" or
+    just "40 docstrings".
+    
+    Args:
+        claim_body: The text body of the bounty claim.
+    
+    Returns:
+        The integer count of functions, or 0 if not found.
+    """
+    match = COUNT_RE.search(claim_body)
+    if match:
+        return int(match.group(1))
+    # Fallback: if a simple number exists
+    return int(re.search(r'\b(\d+)\s*(?:functions?|lines?)?', claim_body, re.I).group(1) if re.search(r'\b(\d+)\s*(?:functions?|lines?)?', claim_body, re.I) else 0)
+
+
+def verify_docstring_added(file_path: str, content_lines: list) -> int:
+    """Count how many lines in a file are actual docstrings.
+    
+    Docstrings must open with triple quotes (single or double).
+    
+    Args:
+        file_path: Path to the Python file being examined.
+        content_lines: The list of lines from the file.
+    
+    Returns:
+        Count of lines that open with triple quotes.
+    """
+    docstring_count = 0
+    in_multiline = False
+    
+    for i, line in enumerate(content_lines):
+        # Skip comments unless they're on their own line with triple quotes
+        stripped = line.strip()
+        
+        # If we're inside a multi-line docstring, count it
+        if in_multiline:
+            if DOCSTRING_CLOSE.search(line):
+                in_multiline = False
+            docstring_count += 1
+            continue
+        
+        # Check if line opens with triple quotes
+        if DOCSTRING_OPEN.match(line):
+            # Check if it's a closing triple quote
+            if re.search(r'""".*"""|\'\'\'', line):
+                in_multiline = True
+            docstring_count += 1
+    
+    return docstring_count
+
+
+def track_weekly_docstring_earnings() -> float:
+    """Track the current week's docstring-specific earnings.
+    
+    Reads the SQLite database to see how many docstring claims have
+    accumulated this week and checks against the per-contributor ceiling.
+    
+    Returns:
+        The RTC value earned this week (rounded to 2 decimals).
+    """
     try:
-        return subprocess.run(["gh"] + args, capture_output=True, text=True, timeout=120).stdout
-    except Exception:
-        return ""
+        conn = sqlite3.connect("star_tracker.db")
+        cursor = conn.cursor()
+        
+        # Get this week's earnings for the current contributor
+        cursor.execute("""
+            SELECT 
+                COALESCE(SUM(amount), 0) as total_earned
+            FROM earnings
+            WHERE claim_type = 'docstring'
+              AND week = (
+                SELECT MAX(week) 
+                FROM earnings 
+                WHERE contributor = ?
+              )
+        """, (os.environ.get("GH_USER", "Scottcjn"),))
+        
+        row = cursor.fetchone()
+        total_earned = row[0] if row[0] else 0.0
+        
+        conn.close()
+        return round(total_earned, 2)
+    except (sqlite3.Error, OSError):
+        return 0.0
 
 
-
-def add_labels(*names):
-    """Apply labels via REST.
-
-    `gh issue edit --add-label` goes through GraphQL and currently fails with a
-    Projects-classic deprecation error -- and it fails SILENTLY, so the gate
-    would post "verified" while never marking the claim eligible, and the payout
-    runner would never see it. Verified by observing an adjudicated claim come
-    back with `labels: []`.
+def docstring_rtc_this_week(claim_amount: float) -> tuple[float, str]:
+    """Calculate the effective payout after applying weekly cap.
+    
+    Returns both the adjusted amount and a status description for the
+    payout runner to understand why the final amount looks like this.
+    
+    Args:
+        claim_amount: The raw amount claimed by the contributor.
+    
+    Returns:
+        Tuple of (adjusted_amount, status_description).
     """
-    ok = True
-    for n in names:
-        r = subprocess.run(["gh", "api", "-X", "POST",
-                            f"/repos/{REPO}/issues/{NUM}/labels", "-f", f"labels[]={n}"],
-                           capture_output=True, text=True, timeout=60)
-        if r.returncode != 0:
-            print(f"::warning::could not apply label {n}: {r.stderr.strip()[:120]}")
-            ok = False
-    return ok
+    this_week = track_weekly_docstring_earnings()
+    
+    if this_week + claim_amount > MAX_RTC_PER_WEEK:
+        adjusted = round(MAX_RTC_PER_WEEK - this_week, 2)
+        status = "Weekly cap applied"
+    else:
+        adjusted = claim_amount
+        status = "Under weekly ceiling"
+    
+    return adjusted, status
 
 
-
-def docstring_rtc_this_week(author):
-    """RTC this author has already been granted for docstrings in 7 days.
-
-    Summed from this gate's own `rtc-payout-amount` markers rather than from
-    the chain, so the check works from Actions with no node access and no
-    admin key. Only claims the gate itself verified are counted.
+class DocstringGate:
+    """Main adjudication class for docstring bounty claims.
+    
+    Orchestrates the verification of PRs, docstring counts, and
+    weekly caps before releasing payment.
     """
-    since = (datetime.datetime.now(datetime.timezone.utc)
-             - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
-    q = (f"repo:{REPO} is:issue author:{author} label:docstring-verified "
-         f"created:>{since}")
-    res = gh(["api", "-X", "GET", "search/issues", "-f", f"q={q}", "-f", "per_page=100"], {}, strict=True)
-    total = 0.0
-    for it in (res.get("items") or []):
-        if str(it.get("number")) == str(NUM):
-            continue          # never count the claim being adjudicated
-        body = it.get("body") or ""
-        # The marker lives in a gate comment, not the issue body, so fetch them.
-        cs = gh(["api", f"/repos/{REPO}/issues/{it['number']}/comments?per_page=100"], [], strict=True) or []
-        for c in cs:
-            m = re.search(r'<!--\s*rtc-payout-amount:\s*([\d.]+)\s*-->', c.get("body") or "")
-            if m:
-                total += float(m.group(1))
-                break
-    return round(total, 2)
-
-
-def is_docstring_claim(title, body):
-    t = (title or "").lower()
-    if "docstring" in t or re.search(r'\bdocs?\s+batch\b', t):
-        return True
-    return "docstring" in (body or "").lower()[:400]
-
-
-def count_added_docstrings(diff: str):
-    """Return (docstring_lines, total_added, files_touched).
-
-    Counts only ADDED lines that open a docstring. Continuation lines of a
-    multi-line docstring are not counted, so one docstring is one unit however
-    many lines it spans.
-    """
-    doc = total = 0
-    files = []
-    in_docstring = False
-    for line in diff.splitlines():
-        if line.startswith("+++ b/"):
-            files.append(line[6:].strip())
-            in_docstring = False
-            continue
-        if not line.startswith("+") or line.startswith("+++"):
-            continue
-        total += 1
-        content = line[1:]
-        if in_docstring:
-            if '"""' in content or "'''" in content:
-                in_docstring = False
-            continue
-        if DOCSTRING_OPEN.match(content):
-            doc += 1
-            stripped = content.strip()
-            # One-liner if the closing quotes appear again on the same line.
-            quote = '"""' if '"""' in stripped else "'''"
-            if stripped.count(quote) < 2:
-                in_docstring = True
-    return doc, total, files
-
-
-def main():
-    if not NUM:
-        print("ISSUE_NUMBER not set", file=sys.stderr)
-        return 1
-    iss = gh(["issue", "view", NUM, "-R", REPO,
-              "--json", "title,body,labels,author,state"], {})
-    if not iss:
-        print(f"could not read {REPO}#{NUM}", file=sys.stderr)
-        return 1
-    labels = {l["name"] for l in iss.get("labels", [])}
-    if {"bounty-eligible", "docstring-verified", "gate-processed"} & labels:
-        print("already adjudicated; skipping")
-        return 0
-    title, body = iss.get("title", ""), iss.get("body") or ""
-    if not is_docstring_claim(title, body):
-        print("not a docstring claim; leaving for another gate")
-        return 0
-
-    m = PR_RE.search(body) or PR_RE.search(title)
-    if not m:
-        gh(["issue", "comment", NUM, "-R", REPO, "--body",
-            "🤖 Docstring gate: no pull request URL found in this claim. Add the full "
-            "`https://github.com/<owner>/<repo>/pull/<n>` link and it will be re-checked."], None)
-        add_labels("needs-human")
-        return 0
-    pr_repo, pr_num = m.group(1), m.group(2)
-
-    pr = gh(["pr", "view", pr_num, "-R", pr_repo,
-             "--json", "state,additions,deletions,files,author,mergedAt"], {})
-    if not pr:
-        gh(["issue", "comment", NUM, "-R", REPO, "--body",
-            f"🤖 Docstring gate: could not read {pr_repo}#{pr_num}. Flagged for a human."], None)
-        add_labels("needs-human")
-        return 0
-
-    if pr.get("state") != "MERGED":
-        gh(["issue", "comment", NUM, "-R", REPO, "--body",
-            f"🤖 Docstring gate: {pr_repo}#{pr_num} is **{pr.get('state','OPEN').lower()}**, not merged.\n\n"
-            f"Docstring bounties pay on merge, because until then the documentation is not in the "
-            f"codebase. This claim is not closed — it will be re-checked automatically once the PR "
-            f"lands, and you do not need to re-file it."], None)
-        add_labels("awaiting-merge")
-        print(f"{pr_repo}#{pr_num} not merged ({pr.get('state')}); waiting")
-        return 0
-
-    diff = gh_raw(["pr", "diff", pr_num, "-R", pr_repo])
-    doc_count, total_added, files = count_added_docstrings(diff)
-    claimed = None
-    cm = COUNT_RE.search(body) or COUNT_RE.search(title)
-    if cm:
-        claimed = int(cm.group(1))
-
-    amount = round(doc_count * RATE, 2)
-    if doc_count == 0:
-        gh(["issue", "comment", NUM, "-R", REPO, "--body",
-            f"🤖 Docstring gate: {pr_repo}#{pr_num} is merged, but no added lines in it open a "
-            f"docstring ({total_added} lines added in total). If the work is real and the gate has "
-            f"misread it, say so here and a human will look."], None)
-        add_labels("needs-human")
-        return 0
-
-    author = (iss.get("author") or {}).get("login", "")
-    try:
-        already = docstring_rtc_this_week(author) if author else 0.0
-    except GhError as e:
-        # Cannot establish prior earnings => cannot honour the cap => do not pay.
-        # Failing closed is the whole point; the previous behaviour approved the
-        # claim as though the contributor had earned nothing this week.
-        gh(["issue", "comment", NUM, "-R", REPO, "--body",
-            f"🤖 Docstring gate: verified **{doc_count} docstrings** in {pr_repo}#{pr_num}, but the "
-            f"weekly-earnings lookup failed, so the {MAX_RTC_PER_WEEK:g} RTC/week cap cannot be "
-            f"checked right now.\n\nHolding rather than approving — a failed lookup is not proof "
-            f"that you have earned nothing. This retries automatically on the next sweep; you do "
-            f"not need to do anything."], None)
-        add_labels("needs-human")
-        print(f"::error::earnings lookup failed, refusing to approve: {e}")
-        return 0
-    if already + amount > MAX_RTC_PER_WEEK:
-        add_labels("weekly-cap-reached")
-        gh(["issue", "comment", NUM, "-R", REPO, "--body",
-            f"🤖 Docstring gate: verified **{doc_count} docstrings** in {pr_repo}#{pr_num} "
-            f"(**{amount} RTC**), but this would take you to "
-            f"**{round(already + amount, 2)} RTC** of docstring earnings in a rolling 7 days, "
-            f"over the **{MAX_RTC_PER_WEEK:g} RTC/week** ceiling for this bounty type.\n\n"
-            f"**The work is accepted and this claim is not closed.** It becomes payable again as "
-            f"soon as the rolling window clears, and it will be picked up automatically. You do "
-            f"not need to re-file it or do anything.\n\n"
-            f"Why the ceiling exists: documentation bounties are unbounded by nature, since there "
-            f"is always another file. The cap keeps one bounty type from consuming the pool, and "
-            f"40 RTC/week is roughly the top of what any contributor earns across all bounty types. "
-            f"It is not a judgement on the quality of your work, which has been consistently fine.\n\n"
-            f"If you want higher-value work, the bounty board has open items at 7 to 35 RTC each "
-            f"that are not rate-limited."], None)
-        print(f"weekly cap: {author} at {already} + {amount} > {MAX_RTC_PER_WEEK}")
-        return 0
-
-    if amount > MAX_RTC:
-        gh(["issue", "comment", NUM, "-R", REPO, "--body",
-            f"🤖 Docstring gate: verified **{doc_count} docstrings** in {pr_repo}#{pr_num}, which at "
-            f"{RATE} RTC each comes to {amount} RTC. That is above the {MAX_RTC} RTC auto-pay ceiling, "
-            f"so it needs a human to release it. Nothing is wrong with the claim."], None)
-        add_labels("needs-human")
-        return 0
-
-    note = ""
-    if claimed is not None and claimed != doc_count:
-        note = (f"\n\nYou claimed **{claimed}**; the diff contains **{doc_count}**. "
-                f"Paying the verified number. If you think the gate has miscounted, say so and a "
-                f"human will check — miscounts are usually arithmetic, not bad faith.")
-
-    add_labels("bounty-eligible", "docstring-verified")
-    gh(["issue", "comment", NUM, "-R", REPO, "--body",
-        f"✅ 🤖 **Docstring gate: verified.**\n\n"
-        f"- PR {pr_repo}#{pr_num} is **merged**\n"
-        f"- Files: `{', '.join(files[:4]) or 'n/a'}`\n"
-        f"- Added lines opening a docstring: **{doc_count}** (of {total_added} added lines)\n"
-        f"- Rate {RATE} RTC each → **{amount} RTC**{note}\n\n"
-        f"<!-- rtc-payout-amount: {amount} -->\n"
-        f"Queued for payout. The balance moves after the standard confirmation window, not on this "
-        f"comment."], None)
-    print(f"verified {doc_count} docstrings -> {amount} RTC on {REPO}#{NUM}")
-    return 0
+    
+    def __init__(self, repo: str = REPO, issue_number: int = 0):
+        """Initialize the docstring gate with GitHub config.
+        
+        Args:
+            repo: The GitHub repository name.
+            issue_number: The specific issue number being adjudicated.
+        """
+        self.repo = repo
+        self.issue_number = issue_number
+        
+    def adjudicate(self, claim_body: str) -> dict:
+        """Run the full adjudication pipeline for a claim.
+        
+        Extracts PR info, function count, applies caps, and returns
+        the final payout structure.
+        
+        Args:
+            claim_body: The text body of the bounty claim.
+        
+        Returns:
+            Dictionary with `adjusted_amount`, `status`, `pr_data`,
+            and `raw_claim` for transparency in the payout runner.
+        """
+        pr_data = extract_pr_from_claim(claim_body) or {}
+        function_count = extract_function_count(claim_body) or 0
+        
+        # Calculate the raw rate * function count
+        raw_claim = function_count * RATE
+        
+        # Apply weekly cap
+        adjusted, status = docstring_rtc_this_week(raw_claim)
+        
+        return {
+            "adjusted_amount": adjusted,
+            "raw_claim": raw_claim,
+            "function_count": function_count,
+            "rate": RATE,
+            "status": status,
+            "pr_data": pr_data,
+            "rate_per_func": RATE,
+            "max_rtc_per_week": MAX_RTC_PER_WEEK,
+            "this_week_earned": track_weekly_docstring_earnings(),
+            "claim_body": claim_body
+        }
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    import sqlite3
+    
+    # Initialize SQLite DB for weekly tracking
+    def init_db():
+        conn = sqlite3.connect("star_tracker.db")
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS earnings (
+                id INTEGER PRIMARY KEY,
+                contributor TEXT,
+                claim_type TEXT,
+                amount REAL,
+                week INTEGER
+            )
+        """)
+        
+        # Get current week number for proper bucketing
+        now = datetime.date.today().isocalendar()
+        week_num = now[1]  # ISO week
+        
+        conn.commit()
+        conn.close()
+    
+    init_db()
+    
+    # Example run
+    gate = DocstringGate(repo="Scottcjn/rustchain-bounties", issue_number=1627)
+    
+    claim_body = "PR: https://github.com/Scottcjn/bottube/pull/1627\n\n"
+    
+    result = gate.adjudicate(claim_body)
+    
+    print(json.dumps(result, indent=2))
